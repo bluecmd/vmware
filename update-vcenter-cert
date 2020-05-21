@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Manage vCenter certificates."""
+# Copyright (c) 2020, Christian Svensson
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the <organization> nor the
+#       names of its contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+# To use this script, create a user in vCenter with a global role assigned to it
+# that allows updating certificates. I have successfully used the following, but
+# it might be more than what's needed:
+#
+#   Certificates
+#     - Manage certificates
+#   Certificate Management
+#     - Create/Delete (Admins priv).
+#     - Create/Delete (below Admins priv).
+#
+# Then create a vcenter.key or similar containing a single line "$USER:$PASS".
+#
+# To use with certbot, you can use something like this:
+#
+# certbot certonly [..] \
+#   --post-hook 'update-vcenter-cert \
+#     --hostname my-vc.home.network \
+#     --auth-file /home/certer/vcenter.key \
+#     --cert /home/certer/certbot/live/my-vc.home.network/cert.pem \
+#     --privkey /home/certer/certbot/live/my-vc.home.network/privkey.pem \
+#     --chain /home/certer/certbot/live/my-vc.home.network/chain.pem'
+#
+# Remember to add a cronjob to renew, like:
+# 1 */12 * * * certbot renew -n -q
+#
+# That should be it. The script will update the certificates and remove old ones
+# automatically.
+
+import argparse
+import urllib
+
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+import requests
+
+
+class Error(Exception):
+    """Module error class."""
+
+
+class ApiRequestError(Error):
+    """The API request did not go as expected."""
+
+
+class Vcenter:
+    """Representing a vCenter to perform certificate operations upon."""
+
+    def __init__(self, hostname):
+        self._hostname = hostname
+        self._session = None
+
+    def _api(self, url, **kwargs):
+        """Construct an API URL."""
+        args = urllib.parse.urlencode(kwargs)
+        return "https://{}/rest/{}?{}".format(self._hostname, url, args)
+
+    def login(self, username, password, verify=True):
+        """Establish a new session with the target vCenter."""
+        url = self._api("com/vmware/cis/session")
+        response = requests.post(url, auth=(username, password), verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to establish session, the details are:\n {}".format(response.text))
+        self._session = requests.Session()
+        self._session.headers.update({"vmware-api-session-id": response.json()["value"]})
+
+    def logout(self, verify=True):
+        """Terminate an existing session."""
+        url = self._api("com/vmware/cis/session")
+        response = self._session.delete(url, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to terminate session, the details are:\n {}".format(response.text))
+        self._session = None
+
+    def import_root(self, pem, verify=True):
+        """Import a given PEM to the vCenter trust store."""
+        url = self._api("vcenter/certificate-management/vcenter/trusted-root-chains")
+        import_body = {
+            "spec" : {
+                "cert_chain" : {
+                    "cert_chain" : [pem]
+                }
+            }
+        }
+        response = self._session.post(url, json=import_body, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to import root certificate, the details are:\n {}".format(
+                    response.text))
+
+    def set_vcenter_certificate(self, cert_pem, key_pem, chain_pem, verify=True):
+        """Set vCenter certificate used for management TLS."""
+        url = self._api("vcenter/certificate-management/vcenter/tls")
+        set_body = {
+            "spec" : {
+                "cert" : cert_pem,
+                "key": key_pem,
+                "root_cert": chain_pem,
+            }
+        }
+        response = self._session.put(url, json=set_body, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to set certificate, the details are:\n {}".format(
+                    response.text))
+
+
+def construct_x509_chain(pem_leaf, pem_chain):
+    """Assemble, verify, and complete X.509 trust chain."""
+    cert = x509.load_pem_x509_certificate(pem_leaf.encode(), default_backend())
+    last_issuer = cert.issuer
+
+    chain = [(cert, pem_leaf)]
+    for part in pem_chain.split("-----BEGIN")[1:]:
+        part = "-----BEGIN" + part
+        cert = x509.load_pem_x509_certificate(part.encode(), default_backend())
+        if cert.subject != last_issuer:
+            raise Error("Certificate chain issue, issuer is {} but next subject was {}".format(
+                last_issuer, cert.subject))
+        last_issuer = cert.issuer
+        chain.append((cert, part))
+        if cert.issuer == cert.subject:
+            # Found a root, anything else is moot
+            break
+    if cert.issuer != cert.subject:
+        # The last certificate was not a root, see if the system store has what we need
+        system_ca_bundle = open("/etc/ssl/certs/ca-certificates.crt", "r").read()
+        for part in system_ca_bundle.split("-----BEGIN")[1:]:
+            part = "-----BEGIN" + part
+            candidate = x509.load_pem_x509_certificate(part.encode(), default_backend())
+            if candidate.subject == cert.issuer:
+                # Found
+                chain.append((candidate, part))
+                break
+        else:
+            raise Error("Unable to find root, issuer: {}".format(cert.issuer))
+    return chain
+
+
+def _main():
+    parser = argparse.ArgumentParser(description="Manage vCenter certificates")
+    required = parser.add_argument_group("required arguments")
+    required.add_argument(
+        "-H", "--hostname", required=True,
+        help="vCenter hostname")
+    required.add_argument(
+        "-A", "--auth-file", required=True,
+        help="File containing the credentials to use to connect to the vCenter")
+    parser.add_argument(
+        "-V", "--no-verify", action="store_true",
+        help="Do not verify the initial certificate when connecting to the vCenter (INSECURE!)")
+    required.add_argument(
+        "-c", "--cert", metavar="PEM", required=True,
+        help="PEM file containing the certificate to import")
+    required.add_argument(
+        "-p", "--privkey", metavar="PEM", required=True,
+        help="PEM file containing the private key to import")
+    parser.add_argument(
+        "-C", "--chain", metavar="PEM",
+        help="PEM file containing an intermediate certificate to import")
+    args = parser.parse_args()
+
+    auth = open(args.auth_file, "r").read().strip()
+    username, password = auth.split(":")
+    vcenter = Vcenter(args.hostname)
+    pem_ca = open(args.chain, "r").read()
+    pem_leaf = open(args.cert, "r").read()
+    pem_privkey = open(args.privkey, "r").read()
+    setup_verify_cert = not args.no_verify
+
+    chain = construct_x509_chain(pem_leaf, pem_ca)
+    _, leaf_pem = chain[0]
+
+    try:
+        vcenter.login(username, password, verify=setup_verify_cert)
+        chain_pem = ""
+        for _, trust_pem in chain[1:]:
+            vcenter.import_root(trust_pem, verify=setup_verify_cert)
+            chain_pem = chain_pem + trust_pem + "\n"
+        vcenter.set_vcenter_certificate(leaf_pem, pem_privkey, chain_pem, verify=setup_verify_cert)
+    finally:
+        vcenter.logout(verify=setup_verify_cert)
+
+
+if __name__ == "__main__":
+    _main()
